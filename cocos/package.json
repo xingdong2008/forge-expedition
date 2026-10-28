@@ -1,0 +1,10 @@
+{
+  "name": "forge-expedition-cocos",
+  "version": "0.1.0",
+  "private": true,
+  "creator": {
+    "version": "3.8.8"
+  },
+  "type": "2d",
+  "uuid": "e6bac01a-1661-4fe5-b7fe-ba4f453655a7"
+}

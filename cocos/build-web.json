@@ -1,0 +1,10 @@
+{
+  "platform": "web-mobile",
+  "buildPath": "project://build",
+  "outputName": "web-mobile",
+  "startScene": "10f85785-b583-43fa-ac46-4d3271fdb19e",
+  "scenes": [{"url":"db://assets/ForgeTide.scene","uuid":"10f85785-b583-43fa-ac46-4d3271fdb19e"}],
+  "debug": true,
+  "md5Cache": true,
+  "packages": {"web-mobile": {"orientation": "landscape", "embedWebDebugger": false}}
+}
