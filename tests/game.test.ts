@@ -22,6 +22,7 @@ function reachPreparation(game: Game, target = 3): void {
 function defeatBoss(game: Game): void {
   const run = game.data.run!;
   expect(run.wave).toBe(10);
+  for (let i = 0; i < 25; i++) game.update(0.05, stationary);
   const boss = run.enemies.find(enemy => enemy.kind === 'boss')!;
   boss.x = run.x;
   boss.y = run.y;
@@ -65,7 +66,7 @@ describe('game progression', () => {
       expect(game.continueRun()).toBe(true);
     }
     expect(game.data.run?.wave).toBe(10);
-    expect(game.data.run?.enemies.some(enemy => enemy.kind === 'boss')).toBe(true);
+    expect(game.data.run?.spawnWarnings.some(w => w.enemy.kind === 'boss')).toBe(true);
   });
 
   it('fails when the 120-second Boss phase expires', () => {
@@ -198,7 +199,7 @@ describe('melee and monster rewards', () => {
     run.enemies = [target('front', 510, 270), target('armored', 525, 275, 'elite'),
       target('behind', 440, 270), target('far', 600, 270)];
     game.update(0.01, stationary);
-    expect(run.enemies.map(e => e.hp)).toEqual([368, 380, 500, 500]);
+    expect(run.enemies.map(e => e.hp)).toEqual([372, 384, 500, 500]);
     expect(run.projectiles).toHaveLength(0);
     expect(game.slashes).toHaveLength(1);
     const hp = run.enemies[0].hp;
@@ -228,7 +229,8 @@ describe('melee and monster rewards', () => {
       const game = newGame(roll); game.startRun('tutorial');
       game.data.run!.spawnTimer = 0;
       game.update(0.01, stationary);
-      expect(game.data.run!.enemies[0].kind).toBe(kind);
+      expect(game.data.run!.enemies).toHaveLength(0);
+      expect(game.data.run!.spawnWarnings[0].enemy.kind).toBe(kind);
     }
   });
 

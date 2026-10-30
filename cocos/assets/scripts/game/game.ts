@@ -1,5 +1,6 @@
-import { ARENA, COMBAT, MONSTERS, DIFFICULTIES, RULES, isGear, itemStat, salePrice } from './config';
-import type { Difficulty, Enemy, EnemyKind, ForgeOdds, GearKind, InputState, Item, ItemKind, RunState, SaveData, StorageAdapter } from './types';
+import { ELEMENT_COLORS, ELEMENT_RULES, ENCHANTMENTS, ENCHANT_CHANCE, freshStatus, stun, burn } from './elements';
+import { ARENA, SPAWN, COMBAT, MONSTERS, DIFFICULTIES, RULES, WEAPON_KINDS, WEAPONS, weaponKind, weaponProfile, isGear, itemStat, salePrice } from './config';
+import type { Difficulty, Enemy, EnemyKind, ForgeOdds, GearKind, InputState, Item, ItemKind, RunState, SaveData, StorageAdapter, WeaponKind, WeaponElement } from './types';
 
 const clamp = (value: number, low: number, high: number) => Math.max(low, Math.min(high, value));
 const distance = (ax: number, ay: number, bx: number, by: number) => Math.hypot(ax - bx, ay - by);
@@ -7,8 +8,15 @@ const distance = (ax: number, ay: number, bx: number, by: number) => Math.hypot(
 export class Game {
   data: SaveData;
   messages: string[] = [];
+  forgeColor = ELEMENT_COLORS.none;
+  forgeAnimation = 0;
+  forgeVisualKind: WeaponKind | 'armor' = 'dagger';
+  heroTime = 0;
+  heroMoving = false;
   // Visual events are transient: they never change settlement or save contents.
-  slashes: { x: number; y: number; angle: number; ttl: number }[] = [];
+  slashes: { x: number; y: number; angle: number; ttl: number; range: number; weaponKind: WeaponKind; element?: WeaponElement }[] = [];
+  // Locked single-target arrows; flight is transient and cleared on transitions.
+  arrows: { x: number; y: number; angle: number; targetId: string; damage: number; element: WeaponElement; elementalAttack: number }[] = [];
   coinTexts: { x: number; y: number; amount: number; ttl: number }[] = [];
   private random: () => number;
 
@@ -20,8 +28,14 @@ export class Game {
       loaded = raw ? JSON.parse(raw) as SaveData : null;
     } catch { /* A damaged save starts a fresh game. */ }
     this.data = loaded?.version === 1 ? loaded : this.newSave();
-    // All ranged combat is reserved for a future weapon enchantment system.
-    if (this.data.run) this.data.run.projectiles = [];
+    // Discard legacy projectiles. New bow shots use transient locked arrows.
+    if (this.data.run) { this.data.run.projectiles = []; this.data.run.spawnWarnings ??= []; this.initElements(this.data.run); }
+    for (const item of [...this.data.items, ...(this.data.run?.bag ?? []), ...(this.data.run?.choices ?? [])]) {
+      if (item.kind === 'weapon') {
+        if (!WEAPON_KINDS.includes(item.weaponKind!)) item.weaponKind = 'dagger';
+        item.element ??= 'none';
+      }
+    }
     this.ensureStarterGear();
     this.persist();
   }
@@ -59,7 +73,7 @@ export class Game {
     // Carried items were removed from the stash at deployment, so dropping the
     // entire run also discards protected items and gold without death rewards.
     this.data.run = null;
-    this.slashes = []; this.coinTexts = [];
+    this.slashes = []; this.arrows = []; this.coinTexts = [];
     this.ensureStarterGear();
     this.note('已放弃本局，全部随身物品及本局金币丢失。');
     this.persist();
@@ -87,8 +101,14 @@ export class Game {
     this.messages.length = Math.min(this.messages.length, 5);
   }
 
-  private item(kind: ItemKind, tier = 1): Item {
-    return { id: `i${this.data.nextId++}`, kind, tier, level: 0, attempts: 0 };
+  private item(kind: ItemKind, tier = 1, subtype: WeaponKind = 'dagger'): Item {
+    return { id: `i${this.data.nextId++}`, kind, tier, level: 0, attempts: 0,
+      ...(kind === 'weapon' ? { weaponKind: subtype, element: 'none' as const } : {}) };
+  }
+
+  private rewardItem(kind: GearKind, tier: number): Item {
+    const subtype = kind === 'weapon' ? WEAPON_KINDS[Math.floor(this.random() * WEAPON_KINDS.length)] : undefined;
+    return this.item(kind, tier, subtype);
   }
 
   private weightedTier(difficulty: Difficulty, wave = 10): number {
@@ -148,12 +168,14 @@ export class Game {
       secondsLeft: difficulty === 'tutorial' ? RULES.tutorialSeconds : RULES.timedWaveSeconds,
       hp: RULES.maxHp, mp: RULES.maxMp, x: 480, y: 270, bag,
       safeIds: [weaponId, armorId].filter((id): id is string => !!id).slice(0, RULES.safeSlots),
-      weaponId, armorId, enemies: [], projectiles: [], spawnTimer: 1.5,
+      weaponId, armorId, enemies: [], spawnWarnings: [], projectiles: [], spawnTimer: 1.5,
       attackTimer: 0, aoeCooldown: 0, shieldCooldown: 0, shieldTime: 0,
       lootGold: 0, bossRewardWave: 10, bossEarly: false, success: null, choices: [],
     };
     this.slashes = [];
+    this.arrows = [];
     this.coinTexts = [];
+    this.initElements(run);
     this.data.run = run;
     this.note(difficulty === 'tutorial' ? '教学开始：移动并坚持三波。' : '怪物潮来袭，撑过倒计时！');
     this.persist();
@@ -231,18 +253,130 @@ export class Game {
     if (run.hp === 0) this.endRun(false);
   }
 
+  private initElements(run: RunState): void {
+    run.status ??= freshStatus(); run.poisonGrounds ??= []; run.earthStrikes ??= [];
+    for (const enemy of run.enemies) enemy.status ??= freshStatus();
+  }
+
+  private clearElements(run: RunState): void {
+    run.status = freshStatus(); run.poisonGrounds = []; run.earthStrikes = [];
+    for (const enemy of run.enemies) enemy.status = freshStatus();
+  }
+
+  private statusAttack(enemy: Enemy, element: WeaponElement, kind: WeaponKind, attack: number): void {
+    const status = enemy.status ??= freshStatus(); const rule = ELEMENT_RULES[kind];
+    if (element === 'thunder') stun(status, rule.stun * (enemy.kind === 'boss' ? .5 : 1));
+    if (element === 'fire') burn(status, attack * rule.burnRate, rule.burnSeconds, rule.stacks);
+  }
+
+  private groundAttack(element: WeaponElement, kind: WeaponKind, attack: number, hitX: number, hitY: number, x: number, y: number, angle: number): void {
+    const rule = ELEMENT_RULES[kind];
+    if (element === 'poison') this.poison('hero', true, hitX, hitY, rule.poisonRadius, attack * rule.poisonRate, rule.poisonSeconds);
+    if (element === 'earth') this.earth(true, x, y, angle, rule.spikes, rule.reach, attack * rule.earthRate, kind === 'hammer' ? 27 : 18, kind === 'bow');
+  }
+
+  private poison(owner: string, friendly: boolean, x: number, y: number, radius: number, dps: number, remaining: number): void {
+    const run = this.data.run;
+    if (!run || run.phase !== 'battle') return;
+    const grounds = run.poisonGrounds ??= [];
+    while (grounds.filter(p => p.owner === owner).length >= 3) grounds.splice(grounds.findIndex(p => p.owner === owner), 1);
+    if (!friendly) while (grounds.filter(p => !p.friendly).length >= 8) grounds.splice(grounds.findIndex(p => !p.friendly), 1);
+    grounds.push({ owner, friendly, x, y, radius, dps, remaining });
+  }
+
+  private earth(friendly: boolean, x: number, y: number, angle: number, count: number, reach: number, damage: number, radius: number, fromImpact = false): void {
+    const run = this.data.run;
+    if (!run || run.phase !== 'battle') return;
+    (run.earthStrikes ??= []).push({ friendly, damage, age: 0, hitIds: [], spikes: Array.from({ length: count }, (_, index) => {
+      const d = fromImpact ? index * reach / Math.max(1, count - 1) : (index + 1) * reach / count;
+      return { x: x + Math.cos(angle) * d, y: y + Math.sin(angle) * d, delay: index * .08, radius };
+    }) });
+  }
+
+  /** Element damage does not retrigger elements or apply a per-frame minimum of 1. */
+  private elementDamage(target: Enemy | RunState, damage: number): void {
+    const run = this.data.run;
+    if (!run || run.phase !== 'battle' || damage <= 0) return;
+    if (target === run) {
+      run.hp = Math.max(0, run.hp - damage * (run.shieldTime > 0 ? .5 : 1));
+      if (run.hp <= 0) this.endRun(false);
+    } else {
+      const enemy = target as Enemy;
+      if (!run.enemies.includes(enemy)) return;
+      enemy.hp -= damage;
+      if (enemy.hp <= 0) this.killEnemy(enemy);
+    }
+  }
+
+  private tickElements(dt: number): void {
+    const run = this.data.run!;
+    // Damage and timed statuses are part of the saved run. Callers pause by not updating.
+    for (const target of [run, ...run.enemies]) {
+      if (run.phase !== 'battle') return;
+      const status = target.status ??= freshStatus();
+      status.stun = Math.max(0, status.stun - dt);
+      status.immunity = Math.max(0, status.immunity - dt);
+      let damage = 0;
+      for (const flame of status.burns) { damage += flame.dps * Math.min(dt, flame.remaining); flame.remaining = Math.max(0, flame.remaining - dt); }
+      status.burns = status.burns.filter(b => b.remaining > 1e-8);
+      this.elementDamage(target, damage);
+      if (run.phase !== 'battle') return;
+      if (target !== run && !run.enemies.includes(target as Enemy)) continue;
+      const grounds = run.poisonGrounds!.filter(p => p.friendly === (target !== run) && distance(target.x, target.y, p.x, p.y) <= p.radius);
+      if (grounds.length) {
+        // Integrate only actual exposure; overlapping pools contribute the strongest DPS.
+        const exposure = Math.max(...grounds.map(p => Math.min(dt, p.remaining)));
+        const dose = Math.max(...grounds.map(p => p.dps * Math.min(dt, p.remaining)));
+        status.poisonClock += exposure; status.poisonDamage += dose;
+        if (status.poisonClock >= .5 - 1e-8) {
+          this.elementDamage(target, status.poisonDamage); status.poisonClock = 0; status.poisonDamage = 0;
+        }
+      } else { status.poisonClock = 0; status.poisonDamage = 0; }
+    }
+    if (run.phase !== 'battle') return;
+    for (const pool of run.poisonGrounds!) pool.remaining -= dt;
+    run.poisonGrounds = run.poisonGrounds!.filter(p => p.remaining > 1e-8);
+    for (const strike of run.earthStrikes!) {
+      strike.age += dt;
+      for (const spike of strike.spikes) {
+        if (strike.age < spike.delay || strike.age > spike.delay + .28) continue;
+        const targets: (Enemy | RunState)[] = strike.friendly ? [...run.enemies] : [run];
+        for (const target of targets) {
+          const id = target === run ? 'hero' : (target as Enemy).id;
+          if (strike.hitIds.includes(id) || distance(target.x, target.y, spike.x, spike.y) > spike.radius + 12) continue;
+          strike.hitIds.push(id); this.elementDamage(target, strike.damage);
+          if (run.phase !== 'battle') return;
+        }
+      }
+    }
+    run.earthStrikes = run.earthStrikes!.filter(s => s.age < s.spikes[s.spikes.length - 1].delay + .45);
+  }
+
   private spawnEnemy(kind?: EnemyKind): void {
     const run = this.data.run;
     if (!run || run.phase !== 'battle') return;
-    const edge = Math.floor(this.random() * 4);
-    const x = edge < 2 ? (edge === 0 ? ARENA.left + 12 : ARENA.right - 12) : ARENA.left + this.random() * (ARENA.right - ARENA.left);
-    const y = edge >= 2 ? (edge === 2 ? ARENA.top + 12 : ARENA.bottom - 12) : ARENA.top + this.random() * (ARENA.bottom - ARENA.top);
+    let x = 0, y = 0;
+    let placed = false;
+    for (let attempt = 0; attempt < 60; attempt++) {
+      x = ARENA.left + SPAWN.margin + this.random() * (ARENA.right - ARENA.left - SPAWN.margin * 2);
+      y = ARENA.top + SPAWN.margin + this.random() * (ARENA.bottom - ARENA.top - SPAWN.margin * 2);
+      // Randomized grid fallback also terminates for deterministic test RNGs.
+      if (attempt >= 20) {
+        const cell = (attempt - 20 + Math.floor(this.random() * 40)) % 40;
+        x = ARENA.left + SPAWN.margin + (cell % 8) * (ARENA.right - ARENA.left - SPAWN.margin * 2) / 7;
+        y = ARENA.top + SPAWN.margin + Math.floor(cell / 8) * (ARENA.bottom - ARENA.top - SPAWN.margin * 2) / 4;
+      }
+      if (distance(x, y, run.x, run.y) < SPAWN.playerClearance) continue;
+      if ([...run.enemies, ...run.spawnWarnings.map(w => w.enemy)].some(e => distance(x, y, e.x, e.y) < SPAWN.spacing)) continue;
+      placed = true; break;
+    }
+    if (!placed) return;
     const candidates = (Object.keys(MONSTERS) as EnemyKind[]).filter(key => MONSTERS[key].weight > 0);
     let roll = this.random() * candidates.reduce((sum, key) => sum + MONSTERS[key].weight, 0);
     const enemyKind = kind ?? candidates.find(key => (roll -= MONSTERS[key].weight) < 0) ?? 'grunt';
     const baseHp = MONSTERS[enemyKind].hp;
     const hp = Math.round(baseHp * DIFFICULTIES[run.difficulty].hp * (enemyKind === 'boss' ? 1 : 1 + (run.wave - 1) * 0.13));
-    run.enemies.push({ id: `e${this.data.nextId++}`, kind: enemyKind, x, y, hp, maxHp: hp, attackTimer: 0, specialTimer: 2 });
+    run.spawnWarnings.push({ remaining: SPAWN.warningSeconds, enemy: { id: `e${this.data.nextId++}`, kind: enemyKind, x, y, hp, maxHp: hp, attackTimer: 0.4, specialTimer: 2 } });
   }
 
   private killEnemy(enemy: Enemy): void {
@@ -260,11 +394,11 @@ export class Game {
     }
     if (this.random() < stats.rareChance) run.bag.push(this.item(this.random() < 0.6 ? 'luck' : 'quality', tier));
     if (enemy.kind === 'boss') {
-      run.bag.push(this.item(this.random() < 0.5 ? 'weapon' : 'armor', tier));
+      run.bag.push(this.rewardItem(this.random() < 0.5 ? 'weapon' : 'armor', tier));
       this.endRun(true);
       return;
     }
-    if (enemy.kind === 'elite' && this.random() < 0.28) run.bag.push(this.item(this.random() < 0.5 ? 'weapon' : 'armor', tier));
+    if (enemy.kind === 'elite' && this.random() < 0.28) run.bag.push(this.rewardItem(this.random() < 0.5 ? 'weapon' : 'armor', tier));
     if (this.random() < 0.07) run.bag.push(this.item(this.random() < 0.5 ? 'hp' : 'mp'));
   }
 
@@ -272,6 +406,7 @@ export class Game {
     const run = this.data.run;
     if (!run) return;
     for (const enemy of [...run.enemies]) {
+      if ((enemy.status?.stun ?? 0) > 0) continue;
       const dx = run.x - enemy.x;
       const dy = run.y - enemy.y;
       const d = Math.max(1, Math.hypot(dx, dy));
@@ -283,7 +418,14 @@ export class Game {
       enemy.attackTimer -= dt;
       enemy.specialTimer -= dt;
       if (d < (enemy.kind === 'boss' ? 72 : 30) && enemy.attackTimer <= 0) {
-        this.hurtPlayer(MONSTERS[enemy.kind].attack * DIFFICULTIES[run.difficulty].damage);
+        const attack = MONSTERS[enemy.kind].attack * DIFFICULTIES[run.difficulty].damage;
+        this.hurtPlayer(attack);
+        if (run.phase === 'battle' && run.difficulty !== 'tutorial') {
+          if (enemy.kind === 'ranger') stun(run.status!, .25);
+          if (enemy.kind === 'charger' || enemy.kind === 'boss') burn(run.status!, attack * (enemy.kind === 'boss' ? .12 : .1), enemy.kind === 'boss' ? 4 : 3, 1);
+          if (enemy.kind === 'grunt') this.poison(enemy.id, false, run.x, run.y, 28, attack * .1, 2);
+          if (enemy.kind === 'elite') this.earth(false, enemy.x, enemy.y, Math.atan2(dy, dx), 3, 80, attack * .2, 18);
+        }
         enemy.attackTimer = enemy.kind === 'boss' ? 1.2 : 1;
       }
       if (run.phase !== 'battle') return;
@@ -304,7 +446,13 @@ export class Game {
       return;
     }
     if (run.phase !== 'battle') return;
-    const magnitude = Math.min(1, Math.hypot(input.x, input.y));
+    this.initElements(run);
+    const wasStunned = run.status!.stun > 0;
+    this.tickElements(dt);
+    if (run.phase !== 'battle') return;
+    this.heroTime += dt;
+    const magnitude = wasStunned ? 0 : Math.min(1, Math.hypot(input.x, input.y));
+    this.heroMoving = magnitude > 0.05;
     if (magnitude > 0.05) {
       const speed = 165;
       run.x = clamp(run.x + input.x / Math.max(1, magnitude) * speed * dt, ARENA.left + 15, ARENA.right - 15);
@@ -316,30 +464,66 @@ export class Game {
     run.shieldCooldown = Math.max(0, run.shieldCooldown - dt);
     run.shieldTime = Math.max(0, run.shieldTime - dt);
     run.attackTimer -= dt;
-    const nearest = run.enemies.filter(enemy => distance(run.x, run.y, enemy.x, enemy.y) <= COMBAT.meleeRange)
+    const weapon = run.bag.find(item => item.id === run.weaponId && item.kind === 'weapon');
+    const profile = weaponProfile(weapon);
+    const nearest = run.enemies.filter(enemy => distance(run.x, run.y, enemy.x, enemy.y) <= profile.range)
       .sort((a, b) => distance(run.x, run.y, a.x, a.y) - distance(run.x, run.y, b.x, b.y))[0];
-    if (nearest && run.attackTimer <= 0) {
+    if (!wasStunned && weapon && nearest && run.attackTimer <= 0) {
       const angle = Math.atan2(nearest.y - run.y, nearest.x - run.x);
-      this.slashes.push({ x: run.x, y: run.y, angle, ttl: COMBAT.slashSeconds });
-      run.attackTimer = COMBAT.attackInterval;
-      for (const enemy of [...run.enemies]) {
-        const offset = Math.atan2(enemy.y - run.y, enemy.x - run.x) - angle;
-        const delta = Math.atan2(Math.sin(offset), Math.cos(offset));
-        if (distance(run.x, run.y, enemy.x, enemy.y) <= COMBAT.meleeRange && Math.abs(delta) <= COMBAT.meleeHalfAngle) {
-          enemy.hp -= Math.max(1, this.weaponAttack(run) - MONSTERS[enemy.kind].defense);
-          if (enemy.hp <= 0) this.killEnemy(enemy);
+      run.attackTimer = profile.interval;
+      if (weaponKind(weapon) === 'bow') {
+        this.arrows.push({ x: run.x, y: run.y, angle, targetId: nearest.id, damage: this.weaponAttack(run), element: weapon.element ?? 'none', elementalAttack: itemStat(weapon) });
+      } else {
+        this.slashes.push({ x: run.x, y: run.y, angle, ttl: COMBAT.slashSeconds, range: profile.range, weaponKind: weaponKind(weapon), element: weapon.element });
+        this.groundAttack(weapon.element ?? 'none', weaponKind(weapon), itemStat(weapon), nearest.x, nearest.y, run.x, run.y, angle);
+        for (const enemy of [...run.enemies]) {
+          const offset = Math.atan2(enemy.y - run.y, enemy.x - run.x) - angle;
+          const delta = Math.atan2(Math.sin(offset), Math.cos(offset));
+          if (distance(run.x, run.y, enemy.x, enemy.y) <= profile.range && Math.abs(delta) <= COMBAT.meleeHalfAngle) {
+            this.statusAttack(enemy, weapon.element ?? 'none', weaponKind(weapon), itemStat(weapon));
+            enemy.hp -= Math.max(1, this.weaponAttack(run) - MONSTERS[enemy.kind].defense);
+            if (enemy.hp <= 0) this.killEnemy(enemy);
+            if (run.phase !== 'battle') break;
+          }
         }
       }
     }
+    // Flight is cosmetic geometry; damage applies once to the locked target only.
+    for (const arrow of [...this.arrows]) {
+      if (run.phase !== 'battle') break;
+      const target = run.enemies.find(enemy => enemy.id === arrow.targetId);
+      if (!target) { this.arrows = this.arrows.filter(entry => entry !== arrow); continue; }
+      const dx = target.x - arrow.x, dy = target.y - arrow.y;
+      const d = Math.hypot(dx, dy);
+      arrow.angle = Math.atan2(dy, dx);
+      if (d <= COMBAT.arrowSpeed * dt + 12) {
+        this.arrows = this.arrows.filter(entry => entry !== arrow);
+        this.statusAttack(target, arrow.element, 'bow', arrow.elementalAttack);
+        this.groundAttack(arrow.element, 'bow', arrow.elementalAttack, target.x, target.y, target.x, target.y, arrow.angle);
+        target.hp -= Math.max(1, arrow.damage - MONSTERS[target.kind].defense);
+        if (target.hp <= 0) this.killEnemy(target);
+      } else {
+        arrow.x += dx / d * COMBAT.arrowSpeed * dt;
+        arrow.y += dy / d * COMBAT.arrowSpeed * dt;
+      }
+    }
     if (run.phase !== 'battle') return;
+    this.updateEnemies(dt);
+    if (run.phase !== 'battle') return;
+    for (const warning of run.spawnWarnings) warning.remaining -= dt;
+    const ready = run.spawnWarnings.filter(w => w.remaining <= 0);
+    run.spawnWarnings = run.spawnWarnings.filter(w => w.remaining > 0);
+    run.enemies.push(...ready.map(w => w.enemy));
     if (run.wave < 10) {
       run.spawnTimer -= dt;
-      if (run.spawnTimer <= 0 && run.enemies.length < (run.difficulty === 'tutorial' ? 5 : 9 + run.wave)) {
-        this.spawnEnemy();
+      const cap = run.difficulty === 'tutorial' ? 5 : 9 + run.wave;
+      if (run.spawnTimer <= 0) {
+        const count = Math.min(cap - run.enemies.length - run.spawnWarnings.length,
+          (run.difficulty === 'tutorial' ? 2 : 3) + Math.floor(this.random() * (run.difficulty === 'tutorial' ? 2 : 3)));
+        for (let i = 0; i < count; i++) this.spawnEnemy();
         run.spawnTimer = run.difficulty === 'tutorial' ? 3.3 : Math.max(1.15, 2.5 - run.wave * 0.12);
       }
     }
-    this.updateEnemies(dt);
     if (run.phase !== 'battle') return;
     if (run.secondsLeft <= 0) {
       if (run.wave === 10) this.endRun(false);
@@ -351,7 +535,10 @@ export class Game {
     const run = this.data.run;
     if (!run) return;
     run.completedWaves = run.wave;
+    this.arrows = []; this.slashes = [];
+    this.clearElements(run);
     run.enemies = [];
+    run.spawnWarnings = [];
     run.projectiles = [];
     run.lootGold += run.difficulty === 'tutorial' ? 10 : 20;
     if (run.difficulty === 'tutorial' && run.wave === RULES.tutorialWaves) { this.endRun(true); return; }
@@ -367,10 +554,13 @@ export class Game {
     const run = this.data.run;
     if (!run) return;
     run.wave++;
+    this.arrows = []; this.slashes = [];
+    this.clearElements(run);
     run.phase = 'battle';
     run.secondsLeft = run.difficulty === 'tutorial' ? RULES.tutorialSeconds : run.wave === 10 ? RULES.bossSeconds : RULES.timedWaveSeconds;
     run.spawnTimer = 1;
     run.enemies = [];
+    run.spawnWarnings = [];
     run.projectiles = [];
     if (run.wave === 10) this.spawnEnemy('boss');
     this.note(run.wave === 10 ? '最终 Boss 出现！' : `第 ${run.wave} 波开始。`);
@@ -399,12 +589,15 @@ export class Game {
     const run = this.data.run;
     if (!run || run.phase === 'result') return;
     run.phase = 'result';
+    this.arrows = []; this.slashes = [];
+    this.clearElements(run);
     run.success = success;
     run.enemies = [];
+    run.spawnWarnings = [];
     run.projectiles = [];
     if (!success) {
       const tier = this.weightedTier(run.difficulty, run.completedWaves);
-      run.choices = [this.item('weapon', tier), this.item('armor', tier)];
+      run.choices = [this.rewardItem('weapon', tier), this.item('armor', tier)];
     }
     this.note(success ? '撤退成功，战利品归仓。' : '撤退失败，安全箱保留三件物品。');
     this.persist();
@@ -437,11 +630,12 @@ export class Game {
 
   sellRunItem(id: string): boolean {
     const run = this.data.run;
-    if (!run || run.phase !== 'result' || !run.success) return false;
-    const index = run.bag.findIndex(item => item.id === id);
-    if (index < 0) return false;
+    if (!run || (run.phase !== 'prepare' && !(run.phase === 'result' && run.success))) return false;
+    const index = run.bag.findIndex(item => item.id === id && (run.phase !== 'prepare' || item.kind === 'weapon'));
+    if (index < 0 || (run.phase === 'prepare' && run.weaponId === id)) return false;
     if (run.weaponId === id) run.weaponId = null;
     if (run.armorId === id) run.armorId = null;
+    run.safeIds = run.safeIds.filter(entry => entry !== id);
     run.lootGold += salePrice(run.bag[index]);
     run.bag.splice(index, 1);
     this.persist();
@@ -498,16 +692,23 @@ export class Game {
     }
   }
 
-  craft(kind: GearKind, tier: number): boolean {
+  craft(kind: GearKind, tier: number, subtype: WeaponKind = 'dagger'): boolean {
+    if (kind === 'weapon' && !WEAPON_KINDS.includes(subtype)) return false;
     if (this.data.run || tier < 1 || tier > 4 || this.gearCount(kind) >= this.data.capacity[kind]) return false;
     const material = kind === 'weapon' ? 'ore' : 'hide';
     const stock = this.data.items.filter(item => item.kind === material && item.tier >= tier).slice(0, 3);
     if (stock.length < 3) return false;
     const ids = new Set(stock.map(item => item.id));
     this.data.items = this.data.items.filter(item => !ids.has(item.id));
-    const gear = this.item(kind, tier);
+    const gear = this.item(kind, tier, subtype);
+    if (kind === 'weapon') {
+      const roll = this.random();
+      if (roll < ENCHANT_CHANCE) gear.element = ENCHANTMENTS[Math.floor(roll / (ENCHANT_CHANCE / ENCHANTMENTS.length))];
+    }
+    this.forgeColor = ELEMENT_COLORS[gear.element ?? 'none'];
+    this.forgeAnimation = 0.9; this.forgeVisualKind = kind === 'weapon' ? subtype : 'armor';
     this.data.items.push(gear);
-    this.note(`打造成功：${kind === 'weapon' ? '武器' : '护具'}。`);
+    this.note(`打造成功：${kind === 'weapon' ? WEAPONS[subtype].label : '护具'}${gear.element && gear.element !== 'none' ? ` · 附带${({ thunder: '雷', fire: '火', poison: '毒', earth: '土', ice: '冰', wind: '风' })[gear.element]}属性` : ''}。`);
     this.persist();
     return true;
   }
@@ -518,7 +719,7 @@ export class Game {
     let downgrade = Math.min(30, 10 + 2 * n);
     let upgrade = Math.max(20, 50 - 3 * n);
     let same = 100 - broken - downgrade - upgrade;
-    if (item.level >= 10 && item.tier >= 4) { same += upgrade; upgrade = 0; }
+    if (item.kind === 'armor' && item.level >= 10 && item.tier >= 4) { same += upgrade; upgrade = 0; }
     if (item.level <= -3 && item.tier === 1) { same += downgrade; downgrade = 0; }
     if (luck && upgrade > 0) { const shifted = Math.min(10, same); same -= shifted; upgrade += shifted; }
     if (this.data.protectionTime > 0) { same += broken; broken = 0; }
@@ -535,6 +736,8 @@ export class Game {
     const catalyst = this.data.items.find(entry => entry.kind === 'quality');
     if (!material || (luck && !lucky) || (quality && (!catalyst || item.tier >= 4))) return false;
     const odds = this.forgeOdds(item, luck);
+    this.forgeColor = ELEMENT_COLORS[item.element ?? 'none'];
+    this.forgeAnimation = 0.9; this.forgeVisualKind = item.kind === 'weapon' ? weaponKind(item) : 'armor';
     const consumed = new Set([material.id, ...(luck && lucky ? [lucky.id] : []), ...(quality && catalyst ? [catalyst.id] : [])]);
     this.data.items = this.data.items.filter(entry => !consumed.has(entry.id));
     const roll = this.random() * 100;
@@ -548,7 +751,7 @@ export class Game {
       else item.tier = Math.max(1, item.tier - 1);
       this.note('锻造失败：装备降质。');
     } else if (roll >= odds.break + odds.downgrade + odds.same) {
-      item.level = Math.min(10, item.level + 1);
+      item.level = item.kind === 'weapon' ? item.level + 1 : Math.min(10, item.level + 1);
       if (quality) item.tier = Math.min(4, item.tier + 1);
       this.note('锻造成功：属性提升！');
     } else this.note('锻造后属性不变。');
@@ -565,7 +768,9 @@ export class Game {
   }
 
   tickForge(dt: number): void {
-    if (this.data.run || this.data.protectionTime <= 0 || dt <= 0) return;
+    if (this.data.run || dt <= 0) return;
+    this.forgeAnimation = Math.max(0, this.forgeAnimation - Math.min(dt, 0.05));
+    if (this.data.protectionTime <= 0) return;
     this.data.protectionTime = Math.max(0, this.data.protectionTime - Math.min(dt, 0.05));
     if (this.data.protectionTime === 0) {
       this.data.forgeMeter = 0;

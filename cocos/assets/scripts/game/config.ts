@@ -1,4 +1,20 @@
-import type { Difficulty, EnemyKind, GearKind, Item, ItemKind } from './types';
+import type { Difficulty, EnemyKind, GearKind, Item, ItemKind, WeaponKind, WeaponElement } from './types';
+
+export const WEAPON_KINDS: WeaponKind[] = ['dagger', 'longsword', 'bow', 'hammer'];
+export const WEAPONS: Record<WeaponKind, { label: string; attack: number; range: number; interval: number; glyph: string }> = {
+  dagger: { label: '短剑', attack: 8, range: 58, interval: 0.5, glyph: '🗡' },
+  longsword: { label: '长剑', attack: 20, range: 110, interval: 1.6, glyph: '⚔' },
+  bow: { label: '弓箭', attack: 14, range: Infinity, interval: 1.2, glyph: '🏹' },
+  hammer: { label: '锤子', attack: 32, range: 52, interval: 2, glyph: '⚒' },
+};
+export const ELEMENT_LABELS: Record<WeaponElement, string> = { none: '无属性', thunder: '雷', fire: '火', poison: '毒', ice: '冰', wind: '风', earth: '土' };
+export const weaponKind = (item?: Item): WeaponKind => item?.weaponKind ?? 'dagger';
+export const weaponProfile = (item?: Item) => WEAPONS[weaponKind(item)];
+export const gearGlyph = (item: Item): string => item.kind === 'weapon' ? weaponProfile(item).glyph : '▣';
+export function weaponSummary(item: Item): string {
+  const p = weaponProfile(item);
+  return `${p.interval}秒/次 · ${p.range === Infinity ? '全图单体' : `距离 ${p.range}`} · ${ELEMENT_LABELS[item.element ?? 'none']}`;
+}
 
 export const ARENA = { left: 74, right: 886, top: 56, bottom: 478 } as const;
 export const RULES = {
@@ -27,12 +43,12 @@ export function isGear(item: Item): item is Item & { kind: GearKind } {
 export function itemName(item: Item): string {
   if (!isGear(item)) return `${TIERS[item.tier - 1]}${ITEM_LABELS[item.kind]}`;
   const level = item.level > 0 ? ` +${item.level}` : item.level < 0 ? ` · 损耗${-item.level}` : '';
-  return `${TIERS[item.tier - 1]}${item.kind === 'weapon' ? '短刃' : '轻甲'}${level}`;
+  return `${item.kind === 'weapon' && item.element && item.element !== 'none' ? ELEMENT_LABELS[item.element] + '·' : ''}${TIERS[item.tier - 1]}${item.kind === 'weapon' ? weaponProfile(item).label : '轻甲'}${level}`;
 }
 
 export function itemStat(item: Item | undefined): number {
   if (!item || !isGear(item)) return 0;
-  return Math.max(1, item.kind === 'weapon' ? 8 + item.tier * 4 + item.level * 3 : item.tier * 2 + item.level);
+  return Math.max(1, item.kind === 'weapon' ? weaponProfile(item).attack + (item.tier - 1) * 4 + item.level * 3 : item.tier * 2 + item.level);
 }
 
 export function salePrice(item: Item): number {
@@ -40,8 +56,8 @@ export function salePrice(item: Item): number {
 }
 
 // Temporary combat verification boost; set bonusAttack to 0 for balance testing.
-export const COMBAT = { bonusAttack: 120, meleeRange: 78, meleeHalfAngle: Math.PI / 3,
-  attackInterval: 0.65, slashSeconds: 0.28, coinSeconds: 1.2 } as const;
+export const COMBAT = { bonusAttack: 120, meleeHalfAngle: Math.PI / 3,
+  arrowSpeed: 900, slashSeconds: 0.28, coinSeconds: 1.2 } as const;
 
 export const MONSTERS: Record<EnemyKind, {
   label: string; color: string; hp: number; attack: number; defense: number;
@@ -54,3 +70,5 @@ export const MONSTERS: Record<EnemyKind, {
   elite: { label: '金·精英', color: '#d3a05c', hp: 120, attack: 20, defense: 12, speed: 53, weight: 5, gold: 20, materialRolls: 4, materialChance: 1, rareChance: 0.25 },
   boss: { label: '深红·首领', color: '#993e52', hp: 650, attack: 26, defense: 20, speed: 42, weight: 0, gold: 100, materialRolls: 6, materialChance: 1, rareChance: 1 },
 };
+
+export const SPAWN = { warningSeconds: 1.2, playerClearance: 100, spacing: 65, margin: 40 } as const;

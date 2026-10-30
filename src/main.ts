@@ -1,8 +1,10 @@
+import { ELEMENT_COLORS } from '../cocos/assets/scripts/game/elements';
 import './style.css';
-import { DIFFICULTIES, ITEM_LABELS, RULES, isGear, itemName, itemStat, salePrice, TIERS } from '../cocos/assets/scripts/game/config';
+import { drawForgeWorkshop } from '../cocos/assets/scripts/game/forge-art';
+import { COMBAT, WEAPONS, WEAPON_KINDS, weaponProfile, weaponSummary, gearGlyph, DIFFICULTIES, ITEM_LABELS, RULES, isGear, itemName, itemStat, salePrice, TIERS } from '../cocos/assets/scripts/game/config';
 import { Game } from '../cocos/assets/scripts/game/game';
 import { BrowserStorage } from '../cocos/assets/scripts/game/storage';
-import type { Difficulty, GearKind, Item, ItemKind, RunState } from '../cocos/assets/scripts/game/types';
+import type { Difficulty, GearKind, Item, ItemKind, RunState, WeaponKind } from '../cocos/assets/scripts/game/types';
 import { renderArena } from './render';
 
 const game = new Game(new BrowserStorage());
@@ -10,6 +12,7 @@ game.grantForgeTestSupply();
 const app = document.querySelector<HTMLDivElement>('#app')!;
 let tab: 'map' | 'forge' | 'storage' = 'map';
 let selectedGear: string | null = null;
+let craftWeapon: WeaponKind = 'dagger';
 let useLuck = false;
 let useQuality = false;
 let choiceIndex: number | null = null;
@@ -79,8 +82,8 @@ function itemCounts(items: Item[]): string {
 function gearCard(item: Item, actions = ''): string {
   const stat = item.kind === 'weapon' ? '攻击' : '防御';
   return `<div class="gear-card tier-${item.tier}">
-    <div class="gear-glyph">${item.kind === 'weapon' ? '⚔' : '▣'}</div>
-    <div class="gear-info"><strong>${itemName(item)}</strong><small>${stat} ${itemStat(item)} · 已锻造 ${item.attempts} 次</small></div>
+    <div class="gear-glyph">${gearGlyph(item)}</div>
+    <div class="gear-info"><strong>${itemName(item)}</strong><small>${stat} ${itemStat(item)} · 已锻造 ${item.attempts} 次</small>${item.kind === 'weapon' ? `<small>${weaponSummary(item)}</small>` : ''}</div>
     ${actions}
   </div>`;
 }
@@ -114,23 +117,16 @@ function forgePanel(): string {
   const probability = odds ? [
     ['损坏', odds.break, 'danger'], ['降质', odds.downgrade, 'bad'], ['不变', odds.same, 'neutral'], ['升级', odds.upgrade, 'good'],
   ].map(([label, value, color]) => `<div class="odds-row"><span>${label}</span><div class="odds-track"><i class="${color}" style="width:${value}%"></i></div><b>${value}%</b></div>`).join('') : '';
-  return `<div class="section-heading"><div><span class="eyebrow">局外营地 · 炉心工坊</span><h2>锻造台</h2><p>每次操作都会增加风险。查看概率后决定继续，或带着现有装备离开。</p></div></div>
-    <div class="forge-layout">
-      <div class="panel-box"><h3>装备清单</h3><div class="gear-list">${gear.length ? gear.map(item => gearCard(item, `<button class="small ${selected?.id === item.id ? 'selected' : ''}" data-action="select-gear" data-value="${item.id}">选择</button>`)).join('') : '<p class="muted">没有可锻造的装备。先用材料打造一件。</p>'}</div>
-        <div class="craft-recipes">${(['weapon', 'armor'] as GearKind[]).flatMap(kind => [1, 2, 3, 4].map(tier => {
-          const material = kind === 'weapon' ? 'ore' : 'hide';
-          const count = game.data.items.filter(item => item.kind === material && item.tier >= tier).length;
-          return `<div class="craft-row"><span>${TIERS[tier - 1]}${ITEM_LABELS[kind]}</span><button data-action="craft" data-value="${kind}:${tier}" ${count < 3 || game.gearCount(kind) >= game.data.capacity[kind] ? 'disabled' : ''}>材料 3 / ${count}</button></div>`;
-        })).join('')}</div>
-      </div>
-      <div class="panel-box forge-focus">${selected ? `<div class="forge-selected"><div class="forge-anvil">${selected.kind === 'weapon' ? '⚔' : '▣'}</div><div><span class="eyebrow">当前装备</span><h3>${itemName(selected)}</h3><p>${selected.kind === 'weapon' ? '攻击' : '防御'} ${itemStat(selected)} · 品质 ${selected.tier}/4 · 强化 ${selected.level}/10</p></div></div>
-        <div class="odds-list">${probability}</div><div class="forge-options">
-          <label><input type="checkbox" data-action="luck" ${useLuck ? 'checked' : ''} ${hasLuck ? '' : 'disabled'}> 幸运粉尘 <small>升级概率 +10%</small></label>
-          <label><input type="checkbox" data-action="quality" ${useQuality ? 'checked' : ''} ${hasQuality && selected.tier < 4 ? '' : 'disabled'}> 精炼晶核 <small>升级时品质 +1</small></label>
-        </div><button class="primary forge-button" data-action="forge" data-value="${selected.id}" ${stock ? '' : 'disabled'}>继续锻造 <span>消耗 1 份对应材料 · 现有 ${stock}</span></button>` : '<div class="empty-state">选择装备开始锻造。</div>'}
-        <div class="forge-meter"><div><span>锻造值 ${game.data.forgeMeter}/100</span><b id="protect-time">${game.data.protectionTime > 0 ? `不损坏 ${Math.ceil(game.data.protectionTime)} 秒` : '累计至 100 开启保护'}</b></div><div class="meter-track"><i style="width:${game.data.forgeMeter}%"></i></div></div>
-      </div>
-    </div><div class="inventory-strip">${itemCounts(game.data.items)}</div>`;
+  return `<div class="workshop-heading"><div><span class="eyebrow">炉心工坊 · 营地专属</span><h2>矮人的锻造台</h2></div><button class="workshop-close" data-action="tab" data-value="map" aria-label="退出锻造">✕</button></div>
+    <div class="workshop-stage"><aside class="workshop-odds"><h3>本次加工概率</h3>${probability || '<p>先选择一件装备</p>'}<p>武器强化无上限<br>损坏率随次数增加，最高 30%</p><div class="forge-meter"><span>锻造值 ${game.data.forgeMeter}/100</span><b id="protect-time">${game.data.protectionTime > 0 ? `不损坏 ${Math.ceil(game.data.protectionTime)} 秒` : '累计至 100 开启保护'}</b><div class="meter-track"><i style="width:${game.data.forgeMeter}%"></i></div></div></aside>
+    <div class="workshop-art"><canvas id="forge-scene" width="600" height="260" aria-label="熔炉、铁砧、台上武器与挥锤矮人"></canvas><div class="workshop-caption">${selected ? `${itemName(selected)} · ${selected.kind === 'weapon' ? '攻击' : '防御'} ${itemStat(selected)} · 已加工 ${selected.attempts} 次` : '从下方装备栏选择加工对象'}</div></div></div>
+    <div class="workshop-controls"><div class="forge-options"><label><input type="checkbox" data-action="luck" ${useLuck ? 'checked' : ''} ${hasLuck ? '' : 'disabled'}> 幸运粉尘</label><label><input type="checkbox" data-action="quality" ${useQuality ? 'checked' : ''} ${hasQuality && selected && selected.tier < 4 ? '' : 'disabled'}> 精炼晶核</label></div><button class="primary" data-action="forge" data-value="${selected?.id ?? ''}" ${selected && stock && game.forgeAnimation <= 0 ? '' : 'disabled'}>加工装备 · 1 材料（余 ${stock}）</button></div>
+    <p class="workshop-result" role="status">${game.messages[0] ?? '每次加工增加 10 点锻造值，满 100 点触发 30 秒不损坏保护。'}</p>
+    <div class="workshop-inventory" aria-label="选择加工装备">${gear.map(item => `<button class="workshop-slot tier-${item.tier} ${selected?.id === item.id ? 'selected' : ''}" data-action="select-gear" data-value="${item.id}"><span>${gearGlyph(item)}</span><strong>${itemName(item)}</strong><small>${item.kind === 'weapon' ? '攻击' : '防御'} ${itemStat(item)}</small></button>`).join('') || '<p>暂无装备，可在下方打造。</p>'}</div>
+    <details class="workshop-recipes"><summary>打造新装备 · 3 份材料 · 武器 12% 附魔（雷火毒土各 3%）</summary><div class="weapon-options">${WEAPON_KINDS.map(kind => `<button data-action="craft-weapon" data-value="${kind}" class="${craftWeapon === kind ? 'selected' : ''}">${WEAPONS[kind].label}</button>`).join('')}</div><div class="workshop-recipe-grid">${(['weapon', 'armor'] as GearKind[]).flatMap(kind => [1, 2, 3, 4].map(tier => {
+      const count = game.data.items.filter(item => item.kind === (kind === 'weapon' ? 'ore' : 'hide') && item.tier >= tier).length;
+      return `<button data-action="craft" data-value="${kind}:${tier}" ${count < 3 || game.gearCount(kind) >= game.data.capacity[kind] || game.forgeAnimation > 0 ? 'disabled' : ''}>${TIERS[tier - 1]}${kind === 'weapon' ? WEAPONS[craftWeapon].label : '护具'} · ${count}/3</button>`;
+    })).join('')}</div></details>`;
 }
 
 function storagePanel(): string {
@@ -145,21 +141,23 @@ function storagePanel(): string {
 }
 
 function renderCamp(): void {
+  const recipesOpen = camp.querySelector('details')?.open ?? false;
   camp.innerHTML = `<div class="camp-shell"><nav class="camp-nav"><div class="nav-title">营地</div>
     <button data-action="tab" data-value="map" class="${tab === 'map' ? 'active' : ''}"><span>◈</span>冒险地图</button>
     <button data-action="tab" data-value="forge" class="${tab === 'forge' ? 'active' : ''}"><span>⚒</span>锻造台</button>
     <button data-action="tab" data-value="storage" class="${tab === 'storage' ? 'active' : ''}"><span>▣</span>仓库</button>
     <div class="nav-foot"><b>灰烬庭院</b><small>首张地图 · 单人冒险</small></div></nav>
     <section class="camp-content">${tab === 'map' ? mapPanel() : tab === 'forge' ? forgePanel() : storagePanel()}</section></div>`;
+  const recipes = camp.querySelector('details'); if (recipes) recipes.open = recipesOpen;
 }
 
 function renderPrepare(run: RunState): void {
   const safe = new Set(run.safeIds);
   const sorted = [...run.bag].sort((a, b) => Number(isGear(b)) - Number(isGear(a)) || b.tier - a.tier);
-  modal.innerHTML = `<div class="dialog prepare-dialog"><div class="dialog-head"><div><span class="eyebrow">第 ${run.wave} 波已完成</span><h2>整备时间 <span id="prepare-time">${Math.ceil(run.secondsLeft)} 秒</span></h2><p>使用道具、更换装备，或调整安全箱。这里不能锻造。</p></div><div class="prep-status">HP ${Math.ceil(run.hp)} <span>·</span> MP ${Math.ceil(run.mp)}</div></div>
+  modal.innerHTML = `<div class="dialog prepare-dialog"><div class="dialog-head"><div><span class="eyebrow">第 ${run.wave} 波已完成</span><h2>整备时间 <span id="prepare-time">${Math.ceil(run.secondsLeft)} 秒</span></h2><p>换装、出售武器、使用药剂或调整安全箱。售款计入本局金币；这里不能锻造。</p></div><div class="prep-status">HP ${Math.ceil(run.hp)} <span>·</span> MP ${Math.ceil(run.mp)}</div></div>
     <div class="prep-actions"><button data-action="use-hp">生命药剂 +35 (${run.bag.filter(item => item.kind === 'hp').length})</button><button data-action="use-mp">魔力药剂 +30 (${run.bag.filter(item => item.kind === 'mp').length})</button><span>安全箱 ${run.safeIds.length}/3</span></div>
-    <div class="prep-list">${sorted.map(item => `<div class="prep-item"><div class="item-symbol ${isGear(item) ? `tier-${item.tier}` : ''}">${item.kind === 'weapon' ? '⚔' : item.kind === 'armor' ? '▣' : '◆'}</div><div><strong>${itemName(item)}</strong><small>${isGear(item) ? `${item.kind === 'weapon' ? '攻击' : '防御'} ${itemStat(item)}` : '可带入安全箱'}</small></div><div class="prep-item-actions">${isGear(item) ? `<button data-action="equip-run" data-value="${item.id}" class="small ${run.weaponId === item.id || run.armorId === item.id ? 'selected' : ''}">${run.weaponId === item.id || run.armorId === item.id ? '使用中' : '装备'}</button>` : ''}<button data-action="safe" data-value="${item.id}" class="small ${safe.has(item.id) ? 'selected' : ''}">${safe.has(item.id) ? '已保护' : '入箱'}</button></div></div>`).join('')}</div>
-    <div class="dialog-foot"><p>失败时保留箱内三件，再从随机武器与护具中选一件。</p><div><button data-action="continue">继续战斗</button><button class="primary" data-action="boss">提前挑战 Boss</button></div></div></div>`;
+    <div class="prep-list">${sorted.map(item => `<div class="prep-item"><div class="item-symbol ${isGear(item) ? `tier-${item.tier}` : ''}">${isGear(item) ? gearGlyph(item) : '◆'}</div><div><strong>${itemName(item)}</strong><small>${isGear(item) ? `${item.kind === 'weapon' ? '攻击' : '防御'} ${itemStat(item)}` : '可带入安全箱'}</small></div><div class="prep-item-actions">${isGear(item) ? `<button data-action="equip-run" data-value="${item.id}" class="small ${run.weaponId === item.id || run.armorId === item.id ? 'selected' : ''}">${run.weaponId === item.id || run.armorId === item.id ? '使用中' : '装备'}</button>` : ''}${item.kind === 'weapon' ? `<button data-action="sell-run" data-value="${item.id}" class="small" ${run.weaponId === item.id ? 'disabled title="请先装备另一把武器"' : ''}>售 ${salePrice(item)}</button>` : ''}<button data-action="safe" data-value="${item.id}" class="small ${safe.has(item.id) ? 'selected' : ''}">${safe.has(item.id) ? '已保护' : '入箱'}</button></div></div>`).join('')}</div>
+    <div class="dialog-foot"><p>失败时保留箱内三件，再从随机武器与护具中选一件。</p><div><button data-action="home">回到主页</button><button data-action="continue">继续战斗</button><button class="primary" data-action="boss">提前挑战 Boss</button></div></div></div>`;
 }
 
 function renderResult(run: RunState): void {
@@ -195,6 +193,7 @@ function refresh(): void {
 
 function action(action: string, value: string): void {
   const run = game.data.run;
+  if (game.forgeAnimation > 0 && ['forge', 'craft'].includes(action)) return;
   if (confirmHome && !['cancel-home', 'confirm-home'].includes(action)) return;
   if (action === 'home' && run && run.phase !== 'result') {
     homeWasPaused = paused; paused = true; confirmHome = true;
@@ -209,9 +208,10 @@ function action(action: string, value: string): void {
   else if (action === 'select-gear') selectedGear = value;
   else if (action === 'luck') useLuck = !useLuck;
   else if (action === 'quality') useQuality = !useQuality;
-  else if (action === 'craft') { const [kind, tier] = value.split(':'); game.craft(kind as GearKind, Number(tier)); }
+  else if (action === 'craft-weapon') craftWeapon = value as WeaponKind;
+  else if (action === 'craft') { const [kind, tier] = value.split(':'); if (game.craft(kind as GearKind, Number(tier), craftWeapon)) selectedGear = game.data.items.at(-1)!.id; }
   else if (action === 'forge') {
-    game.forge(value, useLuck, useQuality);
+    game.forge(value, useLuck && game.data.items.some(item => item.kind === 'luck'), useQuality && game.data.items.some(item => item.kind === 'quality') && (game.data.items.find(item => item.id === value)?.tier ?? 4) < 4);
     if (!game.data.items.some(item => item.kind === 'luck')) useLuck = false;
     if (!game.data.items.some(item => item.kind === 'quality')) useQuality = false;
   }
@@ -285,7 +285,9 @@ portrait.addEventListener('change', () => { if (portrait.matches) suspendForMobi
 
 
 function updateHud(run: RunState): void {
-  document.querySelector<HTMLElement>('#hud-difficulty')!.textContent = DIFFICULTIES[run.difficulty].label + ' · 灰烬庭院';
+  const weapon = run.bag.find(item => item.id === run.weaponId);
+  const profile = weaponProfile(weapon);
+  document.querySelector<HTMLElement>('#hud-difficulty')!.textContent = `${DIFFICULTIES[run.difficulty].label} · ${profile.label} · 攻 ${COMBAT.bonusAttack + itemStat(weapon)} · ${profile.interval}秒/次`;
   document.querySelector<HTMLElement>('#hud-wave')!.textContent = run.difficulty === 'tutorial' ? `教学 ${run.wave}/3` : run.wave === 10 ? '最终 Boss' : `第 ${run.wave}/10 波`;
   document.querySelector<HTMLElement>('#hud-time')!.textContent = `${Math.max(0, Math.ceil(run.secondsLeft))}s`;
   document.querySelector<HTMLElement>('#hp-fill')!.style.width = `${run.hp / RULES.maxHp * 100}%`;
@@ -298,7 +300,7 @@ function updateHud(run: RunState): void {
   document.querySelector<HTMLElement>('#shield-label')!.textContent = run.shieldCooldown > 0 ? `${Math.ceil(run.shieldCooldown)}s` : '护盾';
   document.querySelector<HTMLElement>('#hp-count')!.textContent = `${run.bag.filter(item => item.kind === 'hp').length}`;
   document.querySelector<HTMLElement>('#mp-count')!.textContent = `${run.bag.filter(item => item.kind === 'mp').length}`;
-  document.querySelector<HTMLElement>('#wave-message')!.textContent = game.messages[0] ?? '';
+  document.querySelector<HTMLElement>('#wave-message')!.textContent = (run.status?.stun ?? 0) > 0 ? '麻痹中：暂时无法移动与普攻' : (run.status?.burns.length ?? 0) > 0 ? `灼烧中 · ${run.status!.burns.length} 层` : game.messages[0] ?? '';
 }
 
 let lastFrame = performance.now();
@@ -315,10 +317,25 @@ function frame(now: number): void {
       game.update(dt, { x: x / size, y: y / size });
       saveTimer += dt;
       if (saveTimer >= 5) { game.persist(); saveTimer = 0; }
-    } else if (!run && tab === 'forge' && !portrait.matches) game.tickForge(dt);
+    } else if (!run && tab === 'forge' && !portrait.matches) {
+      const wasAnimating = game.forgeAnimation > 0; const wasProtected = game.data.protectionTime > 0;
+      game.tickForge(dt);
+      if ((wasAnimating && !game.forgeAnimation) || (wasProtected && !game.data.protectionTime)) renderCamp();
+    }
   }
   const run = game.data.run;
   renderArena(canvas, run, elapsed, game);
+  const forgeCanvas = document.querySelector<HTMLCanvasElement>('#forge-scene');
+  if (forgeCanvas) {
+    const ctx = forgeCanvas.getContext('2d')!;
+    const selected = game.data.items.find(item => item.id === selectedGear);
+    const kind = game.forgeAnimation > 0 ? game.forgeVisualKind : selected?.kind === 'armor' ? 'armor' : selected?.weaponKind ?? 'dagger';
+    drawForgeWorkshop({
+      polygon(points, color) { ctx.fillStyle = color; ctx.beginPath(); points.forEach(([x,y],i) => i ? ctx.lineTo(x,y) : ctx.moveTo(x,y)); ctx.closePath(); ctx.fill(); },
+      circle(x,y,r,color) { ctx.fillStyle=color; ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fill(); },
+      line(points,color,width) { ctx.strokeStyle=color; ctx.lineWidth=width; ctx.beginPath(); points.forEach(([x,y],i) => i ? ctx.lineTo(x,y) : ctx.moveTo(x,y)); ctx.stroke(); },
+    }, kind, game.forgeAnimation, game.forgeAnimation > 0 ? game.forgeColor : ELEMENT_COLORS[selected?.element ?? 'none']);
+  }
   if (run) updateHud(run);
   const currentKey = `${run?.phase ?? 'camp'}:${run?.wave ?? 0}:${paused}`;
   if (viewKey !== currentKey) refresh();
